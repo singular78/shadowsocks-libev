@@ -43,7 +43,7 @@
 
 #endif
 
-#define DEFAULT_CONF_PATH "/etc/shadowsocks/config.json"
+#define DEFAULT_CONF_PATH "/etc/shadowsocks-libev/config.json"
 
 #ifndef SOL_TCP
 #define SOL_TCP IPPROTO_TCP
@@ -60,7 +60,7 @@ int init_udprelay(const char *server_host, const char *server_port,
                   const ss_addr_t tunnel_addr,
 #endif
 #endif
-                  int method, int timeout, const char *iface);
+                  int method, int auth, int timeout, const char *iface);
 
 void free_udprelay(void);
 

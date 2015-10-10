@@ -495,9 +495,8 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
 
     // handshake and transmit data
     if (server->stage == 5) {
-        if (server->auth
-                && !ss_check_crc(remote->buf, &r, server->crc_buf, &server->crc_idx)) {
-            LOGE("crc error");
+        if (server->auth && !ss_check_hash(&remote->buf, &r, server->chunk, server->d_ctx, BUF_SIZE)) {
+            LOGE("hash error");
             report_addr(server->fd);
             close_and_free_server(EV_A_ server);
             close_and_free_remote(EV_A_ remote);
@@ -527,25 +526,31 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
     } else if (server->stage == 0) {
 
         /*
-         * Shadowsocks TCP Relay Protocol:
+         * Shadowsocks TCP Relay Header:
          *
-         *    +------+----------+----------+-----------------+
-         *    | ATYP | DST.ADDR | DST.PORT | AUTH (Optional) |
-         *    +------+----------+----------+-----------------+
-         *    |  1   | Variable |    2     |       16        |
-         *    +------+----------+----------+-----------------+
+         *    +------+----------+----------+----------------+
+         *    | ATYP | DST.ADDR | DST.PORT |    HMAC-SHA1   |
+         *    +------+----------+----------+----------------+
+         *    |  1   | Variable |    2     |      10        |
+         *    +------+----------+----------+----------------+
          *
-         *    If ATYP & ONETIMEAUTH_FLAG(0x10) == 1, AUTH and CRC are enabled.
+         *    If ATYP & ONETIMEAUTH_FLAG(0x10) == 1, Authentication (HMAC-SHA1) is enabled.
+         *
+         *    The key of HMAC-SHA1 is (IV + KEY) and the input is the whole header.
+         *    The output of HMAC-SHA is truncated to 10 bytes (leftmost bits).
          */
 
         /*
-         * Shadowsocks TCP Request Payload CRC (Optional, no CRC for response's payload):
+         * Shadowsocks TCP Request's Chunk Authentication (Optional, no hash check for response's payload):
          *
-         *    +------+-------+------+-------+------+
-         *    | DATA | CRC16 | DATA | CRC16 |     ...
-         *    +------+-------+------+-------+------+
-         *    | 128  |   2   | 128  |   2   |     ...
-         *    +------+-------+------+-------+------+
+         *    +------+-----------+-------------+------+
+         *    | LEN  | HMAC-SHA1 |    DATA     |      ...
+         *    +------+-----------+-------------+------+
+         *    |  2   |    10     |  Variable   |      ...
+         *    +------+-----------+-------------+------+
+         *
+         *    The key of HMAC-SHA1 is (IV + CHUNK ID)
+         *    The output of HMAC-SHA is truncated to 10 bytes (leftmost bits).
          */
 
         int offset = 0;
@@ -661,7 +666,7 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
         offset += 2;
 
         if (auth || (atyp & ONETIMEAUTH_FLAG)) {
-            if (ss_onetimeauth_verify(server->buf + offset, server->buf, offset, server->d_ctx)) {
+            if (ss_onetimeauth_verify(server->buf + offset, server->buf, offset, server->d_ctx->evp.iv)) {
                 LOGE("authentication error %d", atyp);
                 report_addr(server->fd);
                 close_and_free_server(EV_A_ server);
@@ -678,12 +683,11 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
         // XXX: should handle buffer carefully
         if (r > offset) {
             server->buf_len = r - offset;
-            server->buf_idx = offset;
+            memmove(server->buf, server->buf + offset, server->buf_len);
         }
 
-        if (server->auth
-                && !ss_check_crc(server->buf + server->buf_idx, &server->buf_len, server->crc_buf, &server->crc_idx)) {
-            LOGE("crc error");
+        if (server->auth && !ss_check_hash(&server->buf, &server->buf_len, server->chunk, server->d_ctx, BUF_SIZE)) {
+            LOGE("hash error");
             report_addr(server->fd);
             close_and_free_server(EV_A_ server);
             return;
@@ -702,8 +706,7 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
 
                 // XXX: should handle buffer carefully
                 if (server->buf_len > 0) {
-                    memcpy(remote->buf, server->buf + server->buf_idx,
-                           server->buf_len);
+                    memcpy(remote->buf, server->buf + server->buf_idx, server->buf_len);
                     remote->buf_len = server->buf_len;
                     remote->buf_idx = 0;
                     server->buf_len = 0;
@@ -1121,6 +1124,9 @@ static struct server * new_server(int fd, struct listen_ctx *listener)
     server->buf_idx = 0;
     server->remote = NULL;
 
+    server->chunk = (struct chunk *)malloc(sizeof(struct chunk));
+    memset(server->chunk, 0, sizeof(struct chunk));
+
     cork_dllist_add(&connections, &server->entries);
 
     return server;
@@ -1130,6 +1136,13 @@ static void free_server(struct server *server)
 {
     cork_dllist_remove(&server->entries);
 
+    if (server->chunk != NULL) {
+        if (server->chunk->buf != NULL) {
+            free(server->chunk->buf);
+        }
+        free(server->chunk);
+        server->chunk = NULL;
+    }
     if (server->remote != NULL) {
         server->remote->server = NULL;
     }
@@ -1330,6 +1343,9 @@ int main(int argc, char **argv)
         if (timeout == NULL) {
             timeout = conf->timeout;
         }
+        if (auth == 0) {
+            auth = conf->auth;
+        }
 #ifdef TCP_FASTOPEN
         if (fast_open == 0) {
             fast_open = conf->fast_open;
@@ -1383,6 +1399,10 @@ int main(int argc, char **argv)
 #else
         LOGE("tcp fast open is not supported by this environment");
 #endif
+    }
+
+    if (auth) {
+        LOGI("onetime authentication enabled");
     }
 
 #ifdef __MINGW32__
@@ -1458,7 +1478,7 @@ int main(int argc, char **argv)
 
         // Setup UDP
         if (mode != TCP_ONLY) {
-            init_udprelay(server_host[index], server_port, m, atoi(timeout),
+            init_udprelay(server_host[index], server_port, m, auth, atoi(timeout),
                           iface);
         }
 
@@ -1469,10 +1489,6 @@ int main(int argc, char **argv)
     if (manager_address != NULL) {
         ev_timer_init(&stat_update_watcher, stat_update_cb, UPDATE_INTERVAL, UPDATE_INTERVAL);
         ev_timer_start(EV_DEFAULT, &stat_update_watcher);
-    }
-
-    if (auth) {
-        LOGI("onetime authentication enabled");
     }
 
     if (mode != TCP_ONLY) {

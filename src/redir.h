@@ -70,9 +70,7 @@ struct remote {
     struct remote_ctx *recv_ctx;
     struct remote_ctx *send_ctx;
     struct server *server;
-
-    ssize_t crc_idx;
-    char crc_buf[CRC_BUF_LEN];
+    uint32_t counter;
 };
 
 #endif // _LOCAL_H
